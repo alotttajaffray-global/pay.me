@@ -145,6 +145,9 @@ impl StartCommand {
                 // them on /openapi.json misleads agents into attaching
                 // tokens the proxy won't use.
                 pay_core::server::openapi::strip_upstream_auth(&mut doc);
+                // Drop Google Discovery branding/format boilerplate that
+                // adds noise without helping agents call endpoints.
+                pay_core::server::openapi::strip_discovery_boilerplate(&mut doc);
                 Some(Arc::new(doc))
             }
             None => None,

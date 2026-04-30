@@ -268,6 +268,9 @@ fn filter_discovery(doc: &mut Value, allowed: &HashSet<(String, String)>) {
 /// - `auth:` block (Google Discovery) at the root.
 /// - `scopes:` array on every Discovery method, recursively through nested
 ///   resources.
+/// - Top-level `parameters.{access_token,oauth_token,key}` (Google Discovery)
+///   — these are "common parameters" Discovery clients merge into every
+///   request. Same misleading class as per-method scopes.
 pub fn strip_upstream_auth(doc: &mut Value) {
     if let Some(obj) = doc.as_object_mut() {
         // OpenAPI 3 root-level security and securitySchemes bucket.
@@ -280,6 +283,12 @@ pub fn strip_upstream_auth(doc: &mut Value) {
         }
         // Discovery root-level auth block.
         obj.remove("auth");
+        // Discovery root-level common parameters that carry credentials.
+        if let Some(params) = obj.get_mut("parameters").and_then(|v| v.as_object_mut()) {
+            for k in ["access_token", "oauth_token", "key"] {
+                params.remove(k);
+            }
+        }
     }
 
     // Per-operation security on OpenAPI 3 paths.
@@ -306,6 +315,39 @@ pub fn strip_upstream_auth(doc: &mut Value) {
                 mobj.remove("scopes");
             }
         }
+    }
+}
+
+/// Strip Google Discovery boilerplate that's irrelevant for proxy callers:
+/// upstream branding (`icons`, `ownerDomain`, `ownerName`,
+/// `documentationLink`), Discovery-format internals (`discoveryVersion`,
+/// `version_module`, `protocol`, `batchPath`, `revision`, `id`,
+/// `canonicalName`, `fullyEncodeReservedExpansion`), and URL fields that
+/// duplicate `rootUrl` after [`rewrite_urls`] (`baseUrl`, `mtlsRootUrl`).
+///
+/// No-op for OpenAPI 3 documents — none of these field names exist there.
+pub fn strip_discovery_boilerplate(doc: &mut Value) {
+    let Some(obj) = doc.as_object_mut() else {
+        return;
+    };
+    const BOILERPLATE: &[&str] = &[
+        "batchPath",
+        "baseUrl",
+        "canonicalName",
+        "discoveryVersion",
+        "documentationLink",
+        "fullyEncodeReservedExpansion",
+        "icons",
+        "id",
+        "mtlsRootUrl",
+        "ownerDomain",
+        "ownerName",
+        "protocol",
+        "revision",
+        "version_module",
+    ];
+    for k in BOILERPLATE {
+        obj.remove(*k);
     }
 }
 
@@ -514,7 +556,18 @@ fn prune_resources(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_uppercase();
-                let path = m.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                // Prefer `flatPath` over `path`: Google Discovery emits both for
+                // methods with reserved-expansion parameters. `path` uses
+                // `{+model}` which swallows segments (e.g. `v1beta/{+model}` ⊃
+                // `models/gemini-pro`), while `flatPath` is the explicit form
+                // (`v1beta/models/{modelsId}`) that matches the YAML allowlist
+                // path the user actually hits on the proxy. `path` alone is the
+                // fallback for methods without expansion (e.g. `list`).
+                let path = m
+                    .get("flatPath")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| m.get("path").and_then(|v| v.as_str()))
+                    .unwrap_or("");
                 if allowed.contains(&(http_method, canonical_path(path))) {
                     None
                 } else {
@@ -916,6 +969,158 @@ mod tests {
             doc["resources"]["things"]["methods"]["lookup"]["httpMethod"],
             json!("POST")
         );
+    }
+
+    #[test]
+    fn filter_discovery_prefers_flatpath_over_reserved_expansion_path() {
+        // Google Discovery docs for APIs like `generativelanguage` emit both
+        // `path: "v1beta/{+model}:generateContent"` (reserved expansion that
+        // swallows `models/`) and `flatPath: "v1beta/models/{modelsId}:..."`.
+        // The YAML allowlist uses the flatPath form because that's what
+        // proxy callers actually hit. Filtering on `path` alone would drop
+        // every method except `list` (which has no expansion).
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "resources": {
+                "models": {
+                    "methods": {
+                        "list": {
+                            "httpMethod": "GET",
+                            "path": "v1beta/models",
+                            "flatPath": "v1beta/models"
+                        },
+                        "get": {
+                            "httpMethod": "GET",
+                            "path": "v1beta/{+name}",
+                            "flatPath": "v1beta/models/{modelsId}"
+                        },
+                        "generateContent": {
+                            "httpMethod": "POST",
+                            "path": "v1beta/{+model}:generateContent",
+                            "flatPath": "v1beta/models/{modelsId}:generateContent"
+                        },
+                        "embedContent": {
+                            "httpMethod": "POST",
+                            "path": "v1beta/{+model}:embedContent",
+                            "flatPath": "v1beta/models/{modelsId}:embedContent"
+                        },
+                        "notInAllowlist": {
+                            "httpMethod": "POST",
+                            "path": "v1beta/{+model}:somethingElse",
+                            "flatPath": "v1beta/models/{modelsId}:somethingElse"
+                        }
+                    }
+                }
+            }
+        });
+
+        let endpoints = vec![
+            ep(Get, "v1beta/models"),
+            ep(Get, "v1beta/models/{modelsId}"),
+            ep(Post, "v1beta/models/{modelsId}:generateContent"),
+            ep(Post, "v1beta/models/{modelsId}:embedContent"),
+        ];
+        filter_to_endpoints(&mut doc, &endpoints);
+
+        let methods = doc["resources"]["models"]["methods"].as_object().unwrap();
+        assert!(methods.contains_key("list"), "list (no expansion) survived");
+        assert!(methods.contains_key("get"), "get (flatPath match) survived");
+        assert!(
+            methods.contains_key("generateContent"),
+            "generateContent (flatPath match) survived"
+        );
+        assert!(
+            methods.contains_key("embedContent"),
+            "embedContent (flatPath match) survived"
+        );
+        assert!(
+            !methods.contains_key("notInAllowlist"),
+            "notInAllowlist (not in YAML) was dropped"
+        );
+    }
+
+    #[test]
+    fn strip_auth_drops_discovery_root_credential_parameters() {
+        // Google Discovery emits "common parameters" at the root that clients
+        // merge into every request. `access_token`, `oauth_token`, `key`
+        // (API key as query param) carry upstream credentials the proxy
+        // ignores — same class as per-method scopes. Non-auth params like
+        // `fields`, `prettyPrint`, `quotaUser` should survive.
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "parameters": {
+                "access_token": {"description": "OAuth access token", "location": "query"},
+                "oauth_token": {"description": "OAuth 2.0 token", "location": "query"},
+                "key": {"description": "API key", "location": "query"},
+                "fields": {"description": "Partial response selector", "location": "query"},
+                "prettyPrint": {"description": "Pretty-print response", "location": "query"},
+                "quotaUser": {"description": "Quota user", "location": "query"}
+            }
+        });
+        strip_upstream_auth(&mut doc);
+        let params = doc["parameters"].as_object().unwrap();
+        assert!(!params.contains_key("access_token"));
+        assert!(!params.contains_key("oauth_token"));
+        assert!(!params.contains_key("key"));
+        // Non-auth common params survive.
+        assert!(params.contains_key("fields"));
+        assert!(params.contains_key("prettyPrint"));
+        assert!(params.contains_key("quotaUser"));
+    }
+
+    #[test]
+    fn strip_discovery_boilerplate_removes_branding_and_format_internals() {
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "name": "generativelanguage",
+            "version": "v1beta",
+            "title": "Gemini API",
+            "description": "Useful description",
+            "rootUrl": "https://proxy.example.com/",
+            "baseUrl": "https://proxy.example.com/",
+            "mtlsRootUrl": "https://proxy.example.com/",
+            "id": "generativelanguage:v1beta",
+            "icons": {"x16": "http://example.com/16.gif"},
+            "documentationLink": "https://example.com/docs",
+            "ownerDomain": "google.com",
+            "ownerName": "Google",
+            "revision": "20260428",
+            "discoveryVersion": "v1",
+            "version_module": true,
+            "protocol": "rest",
+            "batchPath": "batch",
+            "canonicalName": "Generative Language",
+            "fullyEncodeReservedExpansion": true,
+            "resources": {"models": {"methods": {}}},
+            "schemas": {}
+        });
+        strip_discovery_boilerplate(&mut doc);
+        let obj = doc.as_object().unwrap();
+        // Boilerplate stripped.
+        for k in [
+            "icons", "documentationLink", "ownerDomain", "ownerName", "revision",
+            "discoveryVersion", "version_module", "protocol", "batchPath",
+            "canonicalName", "fullyEncodeReservedExpansion", "id",
+            "baseUrl", "mtlsRootUrl",
+        ] {
+            assert!(!obj.contains_key(k), "expected `{k}` to be stripped");
+        }
+        // Load-bearing fields survive.
+        for k in ["kind", "name", "version", "title", "description", "rootUrl", "resources", "schemas"] {
+            assert!(obj.contains_key(k), "expected `{k}` to survive");
+        }
+    }
+
+    #[test]
+    fn strip_discovery_boilerplate_is_noop_for_openapi3() {
+        let mut doc = json!({
+            "openapi": "3.1.0",
+            "info": {"title": "X", "version": "1.0"},
+            "paths": {"/v1/x": {"get": {}}}
+        });
+        let before = doc.clone();
+        strip_discovery_boilerplate(&mut doc);
+        assert_eq!(doc, before, "OpenAPI 3 docs should be untouched");
     }
 
     #[test]

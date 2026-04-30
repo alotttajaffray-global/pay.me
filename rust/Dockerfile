@@ -17,6 +17,11 @@ RUN git config --global url."https://github.com/".insteadOf "git@github.com:" &&
 
 COPY . .
 
+# pay-pdb embeds the Payment Debugger UI from `pdb/dist`, which lives outside
+# this build context (`./rust`). Production gateway images only need the
+# server, not the PDB UI, so embed the placeholder asset and skip the UI build.
+ENV PAY_PDB_ALLOW_PLACEHOLDER=1
+
 RUN cargo build --release --features gcp_kms
 
 RUN cp target/release/pay /usr/local/bin/pay
