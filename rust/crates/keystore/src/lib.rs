@@ -181,7 +181,7 @@ impl Keystore {
 
     /// Check if a keypair exists for this account.
     pub fn exists(&self, account: &str) -> bool {
-        self.store.exists(&keypair_key(account))
+        validate_account_name(account).is_ok() && self.store.exists(&keypair_key(account))
     }
 
     /// Delete a keypair. `reason` is shown in the OS auth prompt (Touch ID, etc.).
@@ -204,7 +204,9 @@ impl Keystore {
     /// Get the 32-byte public key without requiring auth.
     pub fn pubkey(&self, account: &str) -> Result<Vec<u8>> {
         validate_account_name(account)?;
-        self.store.load(&pubkey_key(account)).map(|z| z.to_vec())
+        let pubkey = self.store.load(&pubkey_key(account))?;
+        validate_pubkey(&pubkey)?;
+        Ok(pubkey.to_vec())
     }
 
     /// Load the full 64-byte keypair. Triggers auth prompt.
@@ -220,7 +222,9 @@ impl Keystore {
     ) -> Result<Zeroizing<Vec<u8>>> {
         validate_account_name(account)?;
         self.auth.authenticate(intent)?;
-        self.store.load(&keypair_key(account))
+        let keypair = self.store.load(&keypair_key(account))?;
+        validate_keypair(&keypair)?;
+        Ok(keypair)
     }
 
     /// Authenticate without loading anything (for standalone prompts).
@@ -241,6 +245,12 @@ impl Keystore {
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
+const KEYPAIR_LEN: usize = 64;
+const PUBKEY_LEN: usize = 32;
+const KEYPAIR_KEY_PREFIX: &str = "keypair:";
+const PUBKEY_KEY_PREFIX: &str = "pubkey:";
+const RESERVED_PUBKEY_SUFFIX: &str = ".pubkey";
+
 fn validate_account_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidKeypair(
@@ -255,13 +265,28 @@ fn validate_account_name(name: &str) -> Result<()> {
             "account name contains invalid characters: {name:?} (allowed: a-z, 0-9, '.', '_', '-')"
         )));
     }
+    if name.to_ascii_lowercase().ends_with(RESERVED_PUBKEY_SUFFIX) {
+        return Err(Error::InvalidKeypair(format!(
+            "account name uses reserved suffix: {RESERVED_PUBKEY_SUFFIX}"
+        )));
+    }
     Ok(())
 }
 
 fn validate_keypair(bytes: &[u8]) -> Result<()> {
-    if bytes.len() != 64 {
+    if bytes.len() != KEYPAIR_LEN {
         return Err(Error::InvalidKeypair(format!(
-            "expected 64 bytes, got {}",
+            "expected {KEYPAIR_LEN} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_pubkey(bytes: &[u8]) -> Result<()> {
+    if bytes.len() != PUBKEY_LEN {
+        return Err(Error::InvalidKeypair(format!(
+            "expected {PUBKEY_LEN} public key bytes, got {}",
             bytes.len()
         )));
     }
@@ -269,11 +294,11 @@ fn validate_keypair(bytes: &[u8]) -> Result<()> {
 }
 
 fn keypair_key(account: &str) -> String {
-    account.to_string()
+    format!("{KEYPAIR_KEY_PREFIX}{account}")
 }
 
 fn pubkey_key(account: &str) -> String {
-    format!("{account}.pubkey")
+    format!("{PUBKEY_KEY_PREFIX}{account}")
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -483,8 +508,45 @@ mod tests {
 
     #[test]
     fn keypair_key_naming() {
-        assert_eq!(keypair_key("default"), "default");
-        assert_eq!(pubkey_key("default"), "default.pubkey");
+        assert_eq!(keypair_key("default"), "keypair:default");
+        assert_eq!(pubkey_key("default"), "pubkey:default");
+    }
+
+    #[test]
+    fn reserved_pubkey_suffix_is_rejected() {
+        let ks = Keystore::in_memory();
+        let result = ks.import("victim.pubkey", &test_keypair(), SyncMode::ThisDeviceOnly);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("reserved suffix"));
+        assert!(!ks.exists("victim.pubkey"));
+    }
+
+    #[test]
+    fn pubkey_rejects_private_keypair_sized_value() {
+        let ks = Keystore::in_memory();
+        ks.store
+            .store(&pubkey_key("victim"), &test_keypair())
+            .unwrap();
+
+        let result = ks.pubkey("victim");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expected 32 public key bytes")
+        );
+    }
+
+    #[test]
+    fn typed_storage_keys_do_not_alias_valid_account_names() {
+        let ks = Keystore::in_memory();
+        ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+
+        assert!(ks.exists("victim"));
+        assert!(!ks.exists("keypair:victim"));
+        assert!(!ks.exists("pubkey:victim"));
     }
 
     #[test]
@@ -569,8 +631,10 @@ mod tests {
             auth_on_write: true,
         };
         // Manually store without going through import (which would also be denied)
-        ks.store.store("test", &test_keypair()).unwrap();
-        ks.store.store("test.pubkey", &[0xBB; 32]).unwrap();
+        ks.store
+            .store(&keypair_key("test"), &test_keypair())
+            .unwrap();
+        ks.store.store(&pubkey_key("test"), &[0xBB; 32]).unwrap();
 
         let result = ks.delete("test", "test");
         assert!(result.is_err());
