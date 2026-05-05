@@ -65,7 +65,7 @@ struct Opts {
     verbose: bool,
 
     /// Use a specific named account from `~/.config/pay/accounts.yml`.
-    /// For `--local` / `--sandbox`, this selects a wallet within `localnet`.
+    /// In sandbox/local modes, this selects a wallet within `localnet`.
     #[arg(long, global = true)]
     account: Option<String>,
 
@@ -195,8 +195,11 @@ fn main() {
 
     // ── Legacy keypair source for non-payment commands ─────────────────────
     //
-    // `pay topup`, `pay claude`, and friends still use the original
+    // `pay topup` and server commands still use the original
     // keystore-source-string flow.
+    // Launcher commands (`pay claude`/`pay codex`) pass only an explicit
+    // `--account` through to the MCP server and must not resolve an account
+    // before the first-run setup hook below.
     // Payment commands (`pay curl`/`wget`/`fetch`) don't read this — they
     // resolve the wallet via `network_override` + `accounts.yml` instead.
     //
@@ -213,6 +216,8 @@ fn main() {
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)
+                | Command::Claude(_)
+                | Command::Codex(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
                 | Command::Http(_)
